@@ -1,0 +1,332 @@
+---
+title: "Forecasting US Retail Sales Using Time Series Models in R"
+author: "Sheneli Weerasinghe"
+format: html
+editor: visual
+---
+
+# Executive Summary
+
+Retail businesses rely on accurate demand forecasts to plan inventory, staffing, and promotional activity. This project develops time-series forecasting models to predict monthly US clothing retail sales using data from the Federal Reserve Economic Data (FRED) database.
+
+A logarithmic transformation was applied to stabilize variance, and seasonal differencing was used to address strong annual patterns in retail demand. Several ARIMA and ETS models were estimated and evaluated using out-of-sample forecast accuracy and residual diagnostics.
+
+The ARIMA model provided the most reliable forecasts, outperforming ETS based on both accuracy metrics and Ljung–Box tests. The results highlight strong and predictable seasonal peaks in retail sales, particularly during the holiday period, which can support planning decisions related to inventory management, staffing, and promotional timing.
+
+```{r}
+library(fredr)
+library(tidyverse)
+library(tsibble)
+library(fable)
+library(fpp3)
+library(scales)
+
+fredr_set_key("cb159db4ea49603bda6644759f19936d")
+
+retail_sales <- fredr(
+  series_id = "RSCCASN",
+  observation_start = as.Date("1992-01-01")
+)
+
+retail_ts <- retail_sales |>
+  select(date, value) |>
+  rename(Month = date, Sales = value) |>
+  mutate(
+    Month = yearmonth(Month),
+    Sales = Sales / 1000   # convert millions → billions
+  ) |>
+  as_tsibble(index = Month)
+```
+
+# Plotting the Data & Describing the Statistical Features
+
+```{r}
+autoplot(retail_ts, Sales) +
+labs(
+title = "Monthly US Clothing Retail Sales",
+y = "Sales ($ Billion)",
+x = "Month"
+) 
+```
+
+The monthly retail data shows that there has been a general upwards trend since 1992. There are two shocks present were sales decreased temporarily. The first was a small shock around 2008, likely due to the GFC. The second was a very large shock around 2020, likely due to COVID. There also appears to be a strong seasonal pattern present.
+
+```{r}
+gg_season(retail_ts, labels="both") + labs(y = "Sale ($ Billion)", title = "Seasonal Plot: US Clothing Retail Sales")
+
+```
+
+This graph shows that sales increase every year from November to December, likely due to people spending more on clothing around the Christmas period. There also seems to be in an increase in the level of seasonality throughout the years, which makes a box-cox transformation appropriate.
+
+# Box-Cox Transformation
+
+```{r}
+retail_ts |> features(Sales, features= guerrero) |> pull(lambda_guerrero)
+```
+
+The appropriate Box Cox transformation is λ = 0.4243897.
+
+```{r}
+retail_ts |> autoplot(box_cox(Sales, 0.4243897)) + labs(y = "Box Cox Sales, 0.4243897 ($ Billion)", title = "Transformed Turnover with λ = 0.4243897")
+```
+
+```{r}
+ldcomp <- retail_ts |> model(stl = STL(box_cox(Sales, 0.4243897)))
+ components(ldcomp) 
+ components(ldcomp) |> autoplot()
+```
+
+The STL decomposition highlights a strong and stable seasonal pattern in retail sales. There also appears to be a clear upward trend, even without the effect of seasonality. The remainder component shows a large spike around 2020, reflecting the impact of the COVID-19 shock. This indicates that STL decomposition, cannot explain all the structure in the data, and further analysis must be done.
+
+# Differencing to Make Data Stationary
+
+## Training and Test Set
+
+```{r}
+ret_tr <- retail_ts[1:385,]
+ret_ts <- retail_ts[386:409,]
+```
+
+A test set was created using the last 24 months of data. The rest of the data was placed into a training set.
+
+```{r}
+ret_tr |> features(Sales, unitroot_nsdiffs)
+```
+
+The data contains seasonality, therefore differencing is required to prevent biased forecasts. A unit root test determined that one seasonal difference needed to be added, which a lag of 12.
+
+The Guerrero method suggested a Box-Cox transformation with λ ≈ 0.42. However, a logarithmic transformation (λ = 0) was used instead for simplicity and interpretability, as it effectively stabilizes variance and allows changes to be interpreted as approximate percentage growth.
+
+```{r}
+ret_tr |> gg_tsdisplay(difference(log(Sales), lag = 12), plot_type = "partial") + labs(title = "Differenced Retail Data (Jan 1992 - Jan 2026) Residual Plots")
+```
+
+There appears to still be a trend in the data and the unit root test is used to confirm this.
+
+```{r}
+ret_tr |> features(difference(log(Sales), lag = 12), unitroot_kpss)
+```
+
+The p-value is 0.0419, supporting the hypothesis that the data is still not stationary. However, a unit root ordinary difference test indicated that ordinary differences needed to be added. The series is likely not stationary due to the sales drop that occurred around COVID.
+
+```         
+ret_tr |> features(difference(log(Sales), lag = 12), unitroot_ndiffs)
+```
+
+# Creating a Shortlist of ARIMA and ETS Models
+
+## ETS Models
+
+### Choosing Appropriate ETS Models
+
+```{r}
+ETS_fit <- ret_tr |>
+model(ETS = ETS(Sales), Drift = RW(Sales~drift()), NAIVE = NAIVE(Sales), SNAIVE = SNAIVE(Sales))
+```
+
+The ETS model automatically chosen was ETS(M,N,M). The benchmarks random walk, snaive and naive were chosen. Mean was not chosen as a benchmark due to seasonality and an increasing trend in the data. The other benchmarks were more appropriate.
+
+Other potential models were considered. The first is the Damped Holt's method, which may be more accurate due to dampening the effect of the trend.
+
+Two more potential models that can be tested are the same Holt and Damped Holt models as above, but with additive errors.
+
+So the short list of ETS models are: Holt(M,N,M) Damped Holt(M,Ad,M) Holt(A,N,M) Damped Holt(A,Ad,M)
+
+```{r}
+ETS_fit <- ret_tr |>
+  model(
+    Holt_MNM     = ETS(Sales ~ error("M") + trend("N") + season("M")),
+    Damped_MAdM  = ETS(Sales ~ error("M") + trend("Ad", phi = 0.9) + season("M")),
+    Holt_ANM     = ETS(Sales ~ error("A") + trend("N") + season("M")),
+    Damped_AAdM  = ETS(Sales ~ error("A") + trend("Ad", phi = 0.9) + season("M"))
+  )
+
+glance(ETS_fit) |> select(.model, AIC, AICc)
+```
+
+The model with the lowest AIC and AICc is the Holt ETS(M,N,M) model, which was the automatic model. The next lowest model is the Damped ETS(M,Ad,M) model which has an AIC and AICc that is higher than the Holt (M,A,M) model by 6-7. The Holt (A,N,M) and Damped (A,Ad,M) models have much slightly higher AICs and AICcs compared to the Holt (M,N,M) and Damped (M,Ad,M)
+
+### Testing the accuracy of the ETS Models on the Test Set
+
+```{r}
+ETS_fc1 <- forecast(ETS_fit, h=24) |>
+filter(.model=='Holt_MNM') 
+
+ETS_fc2 <- forecast(ETS_fit, h=24) |>
+filter(.model=='Damped_MAdM') 
+
+ETS_fc3 <- forecast(ETS_fit, h=24) |>
+filter(.model=='Holt_ANM') 
+
+ETS_fc4 <- forecast(ETS_fit, h=24) |>
+filter(.model=='Damped_AAdM') 
+```
+
+First produce forecasts for the test data using each model.
+
+```{r}
+ETS_fc_accuracy <- bind_rows(
+  accuracy(ETS_fc1, ret_ts) |> select(.model, RMSE),
+  accuracy(ETS_fc2, ret_ts) |> select(.model, RMSE),
+  accuracy(ETS_fc3, ret_ts) |> select(.model, RMSE),
+  accuracy(ETS_fc4, ret_ts) |> select(.model, RMSE)
+)
+
+print(ETS_fc_accuracy)
+```
+
+The model with the lowest RMSE is the Damped (A,Ad,M) model, even though it performed the second worst for AIC. The Damped (M,N,M) and Damped(M,Ad,M) model have an RMSE that is only slightly higher. The Holt (A,N,M) performed the best for RMSE.
+
+Therefore, when taking both AIC and RMSE into account, the best model is Holt ETS (M,N,M) as it performs the best for AIC and the second best for RMSE.
+
+## ARIMA Models
+
+Several candidate ARIMA models were estimated based on ACF/PACF diagnostics. These models were compared using AICc, out-of-sample forecast accuracy, and residual diagnostics.
+
+```{r}
+ret_tr |> gg_tsdisplay(difference(log(Sales), lag = 12), plot_type = "partial", lag_max = 84) + labs(title = "Differenced Retail Data (Jan 1992 - Jan 2026) Residual Plots")
+```
+
+### ARIMA Model based on ACF
+
+The ACF plot shows 7 significant lags before lag 12, therefore q = 7. The last significant seasonal lag is at 12, therefore Q = 1. So one potential model is ARIMA(0,0,7)(0,1,1)\[12\]
+
+However, lag 6 & 7 are only slightly significant .Therefore q can also = 5 So another potential model is ARIMA(0,0,5)(0,1,1)\[12\]
+
+### ARIMA Model based on PACF
+
+There are 6 significant lags before lag 12, therefore p = 6. The last significant seasonal lag is at 72 therefore P = 6. So the model based on PACF is ARIMA(6,0,0)(6,1,0)\[12\]. Lag 24 is barely significant, therefore P=2. So another potential model is ARIMA(6,0,0)(2,1,0)\[12\]
+
+So 4 potential models are a1 = ARIMA(0,0,7)(0,1,1)\[12\], a2 = ARIMA(0,0,5)(0,1,1)\[12\], a3 = ARIMA(6,0,0)(6,1,0)\[12\] & a4 = ARIMA(6,0,0)(2,1,0)\[12\].
+
+```{r}
+AR_fit <- ret_tr |>
+model(a1 = ARIMA(log(Sales) ~ 0 + pdq(0,0,7) + PDQ(0,1,1)),
+a2 = ARIMA(log(Sales) ~ 0 + pdq(0,0,5) + PDQ(0,1,1)),
+a3 = ARIMA(log(Sales) ~ 0 + pdq(6,0,0) + PDQ(6,1,0)),
+a4 = ARIMA(log(Sales) ~ 0 + pdq(6,0,0) + PDQ(2,1,0)))
+```
+
+### Forecast models
+
+```{r}
+AR_fc1 <- forecast(AR_fit, h=24) |>
+filter(.model=='a1') 
+
+AR_fc2 <- forecast(AR_fit, h=24) |>
+filter(.model=='a2') 
+
+AR_fc3 <- forecast(AR_fit, h=24) |>
+filter(.model=='a3') 
+
+AR_fc4 <- forecast(AR_fit, h=24) |>
+filter(.model=='a4') 
+```
+
+### AIC and RMSE of the ARIMA Models
+
+```{r}
+glance(AR_fit) |> select(.model,AIC, AICc)
+
+AR_fc_accuracy <- bind_rows(
+  accuracy(AR_fc1, ret_ts) |> select(.model, RMSE),
+  accuracy(AR_fc2, ret_ts) |> select(.model, RMSE),
+  accuracy(AR_fc3, ret_ts) |> select(.model, RMSE),
+  accuracy(AR_fc4, ret_ts) |> select(.model, RMSE)
+)
+
+print(AR_fc_accuracy)
+```
+
+a3 has the lowest AIC and AICc by far, however is also has the highest RMSE by far as well. a4 has the lowest RMSE by far and the second lowest AIC/AICc. Therefore based on these metrics, ARIMA(6,0,0)(2,1,0)\[12\] has been chosen as the preferred model.
+
+# Best ARIMA and ETS
+
+Best ETS model - Holt(M,N,M)
+
+Best ARIMA Model - ARIMA(6,0,0)(2,1,0)\[12\]
+
+```{r}
+tidy(AR_fit) |> filter(.model=='a4') |> select(term, estimate, std.error, statistic,p.value)
+
+tidy(ETS_fit) |> filter(.model=='Holt_MNM') |> select(term, estimate)
+```
+
+## Residuals and Ljung-Box test
+
+```{r}
+ETS_fit |> select(Damped_MAdM) |> gg_tsresiduals(lag=48) + 
+  labs(title = "Holt (M,N,M) Residual Plots")
+
+augment(ETS_fit) |>
+  filter(.model == "Holt_MNM") |>
+  features(.innov, ljung_box, lag = 24) 
+
+AR_fit |> select(a4) |> gg_tsresiduals(lag=48) + 
+  labs(title = "ARIMA(6,0,0)(2,1,0)[12] Residual Plots")
+
+augment(AR_fit) |> filter(.model=='a4') |>
+features(.innov, ljung_box, lag = 24, dof = 8)
+```
+
+The innovation residuals for the ETS model look like they have a mean of 0. The residual plot shows a normal distribution. The ACF plot has patterns and has quite a few significant lags. This suggests that the residuals are auto-correlated. To further investigate if the residuals are white noise, the Ljung-Box test was used. The test produces a statistically significant p-value of 0, indicating significant auto-correlation.
+
+For the ARIMA residuals, the innovation residual plot seems to have a mean of 0. The residual plot shows a normal distribution. The ACF plot also has patterns, and a few significant lags, meaning there is auto-correlation in the residuals.The the Ljung-Box test produces a p-value of 0.122, therefore the hypothesis that the residuals are not white noise is rejected.
+
+Therefore the ARIMA(1,0,1)(0,1,1)\[12\] model is likely to produce the best forecast as it provided the lowest forecast error while maintaining well-behaved residuals. The ETS model fails to capture important temporal dependencies in the data and is therefore less suitable than ARIMA for this application.
+
+## Forecasts
+
+```{r}
+ETS_fc1 |>
+autoplot(ret_tr) + labs(y = "Sales ($ Billion)", title = "ETS 24 Month Forecast of US Clothing Sales")
+
+AR_fc4 |>
+autoplot(ret_tr) + labs(y = "Sales ($ Billion)", title = "ARIMA 24 Month Forecast of US Clothing Sales")
+```
+
+# Forecasting Using Full Data Set
+
+## Fitting on the models on the full data set
+
+```{r}
+AR_best <- retail_ts |>
+model(ARIMA(log(Sales) ~ 0 + pdq(6,0,0) + PDQ(2,1,0)))
+
+ETS_best <- retail_ts |>
+  model(ETS(Sales ~ error("M") + trend("N") + season("M")))
+```
+
+The model forecasts indicate predictable seasonal increases in retail demand during the holiday period, providing a useful basis for short-term planning.
+
+# Benefits and Limitations of the Models
+
+## Comparing ARIMA and ETS for this dataset
+
+An advantage of ETS is that it can handles trends and seasonality directly. On the other hand, ARIMA assumes linear relationships and stationarity, meaning that for this dataset, the ARIMA models required differencing.
+
+An advantage of ARIMA models are that they capture lagged effects, whereas ETS models do not. Capturing lagged effects is important when modelling retail turnover. For example, an economic shock that cause low sales in one month may cause sales to still be low in the next month.
+
+## Comparing ARIMA and ETS to other models for the dataset
+
+ARIMA and ETS predict purely on temporal patterns - trends and seasonality. There may be other relationships in the data ARIMA and ETS are not capturing.
+
+Unlike ARIMA and ETS, dynamic modelling allows for a change in parameters and can also adapt/switch behaviour. Therefore, dynamic modelling is better at capturing structural shocks such as COVID-19.
+
+# Final Model Selection
+
+Based on AICc, out-of-sample forecast accuracy, and residual diagnostics, the ARIMA(1,0,1)(0,1,1)\[12\] model was selected as the final model.
+
+This model achieved the lowest forecast error while maintaining residuals that resemble white noise, indicating that it adequately captures the underlying time-series structure.
+
+Simpler models performed similarly but were preferred where appropriate to avoid overfitting and improve interpretability.
+
+# Conclusion
+
+This analysis developed and evaluated time-series forecasting models for monthly US clothing retail sales. Exploratory analysis revealed strong seasonal patterns and an upward trend, motivating the use of logarithmic transformation and seasonal differencing.
+
+Among the models considered, ARIMA specifications provided the best overall performance. Residual diagnostics indicated that these models more effectively captured the underlying time-series structure compared to ETS, which exhibited significant remaining autocorrelation.
+
+From a business perspective, the forecasts demonstrate consistent seasonal peaks in retail demand during late-year holiday periods. These insights can support operational decisions such as inventory planning, workforce allocation, and promotional scheduling.
+
+Overall, the results highlight the importance of combining statistical modelling with domain understanding to produce forecasts that are both accurate and actionable.
